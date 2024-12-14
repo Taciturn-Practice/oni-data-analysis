@@ -1,0 +1,225 @@
+# Blueprint simulator - Personal Edition
+
+``` {r Setup, echo = FALSE, message = FALSE}
+
+library(readxl)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(furrr)
+library(future)
+library(stringr)
+
+# Custom variables
+path_blueprint_xlsx <- "G:/My Drive/Gaming/Oxygen Not Included/blueprint_supply_closet.xlsx"
+path_simdata        <- "../Data/simdata_blueprint_personal.RData"
+path_simulation_R   <- "../R/simulate_blueprints.R"
+filament_collected  <- 10300 # Add your custom amount of starting filament
+n_sim               <- 1000  # Default: 1000
+use_seed            <- as.integer(Sys.Date())
+force               <- FALSE # Default FALSE; Whether to force simulation or use simdata if it exists
+```
+
+## Description
+
+A script that simulates how long it takes to gather all remaining blueprints based on your personal inventory (saved in separate Excel sheet). Which takes into account the individual probabilities of the remaining blueprints. This script uses either a spender or hoarder strategy.
+
+The spender strategy buys a new blueprint along the way while recycling any excess blueprints. The hoarder strategy instead saves all filaments from recycled blueprints and waits until has enough to buy all remaining missing blueprints (called here the *filament tipping point*).
+
+If you want to change or update the underlying probabilities for each tier (perhaps based on your own measurements) then you can update them in the Excel file under the Data sheet. 
+
+``` {r Loading data, echo = FALSE, message = FALSE}
+blueprints <- read_xlsx(path = path_blueprint_xlsx,
+                        sheet = "Blueprints",
+                        col_names = c("id", "primary", "secondary", "item_name", "tier", "owned"),
+                        skip = 1) |>
+  mutate(across(c(primary, secondary, tier), as.factor),
+         owned = as.logical(ifelse(owned == "Yes", 1, 0)))
+
+blueprint_data <- read_xlsx(path = path_blueprint_xlsx,
+                            sheet = "Data",
+                            col_names = c("tier", "cost", "n_items", "prob", "prob_item"),
+                            skip = 1) |>
+  mutate(tier = as.factor(tier))
+
+n_total <- sum(blueprint_data$n_items)
+n_owned <- nrow(filter(blueprints, owned == TRUE))
+
+source(file = path_simulation_R)
+```
+
+By default the simulation works based on previously observed probabilities which are:
+
+* Common:   `r signif(filter(blueprint_data, tier == "Common")$prob, digits = 2)`
+* Decent:   `r signif(filter(blueprint_data, tier == "Decent")$prob, digits = 2)`
+* Nifty:    `r signif(filter(blueprint_data, tier == "Nifty")$prob, digits = 2)`
+* Splendid: `r signif(filter(blueprint_data, tier == "Splendid")$prob, digits = 2)`
+
+## Personal
+
+```{r Personal, echo = FALSE, message = FALSE}
+n_by_tier <- blueprints |>
+  filter(owned == TRUE) |>
+  count(tier)
+```
+
+Found a total of `r n_owned` out of `r n_total` already claimed blueprints. Remaining number of blueprints is `r n_total - n_owned`. Additionally, a total of `r as.integer(filament_collected)` filament has been collected and will be used in the simulations.
+
+Found a total of blueprints for each tier:
+
+* Common:   `r filter(n_by_tier, tier == "Common")$n`
+* Decent:   `r filter(n_by_tier, tier == "Decent")$n`
+* Nifty:    `r filter(n_by_tier, tier == "Nifty")$n`
+* Splendid: `r filter(n_by_tier, tier == "Splendid")$n`
+
+## Simulation conditions
+
+The number of blueprints claimable per week is 6.
+
+The average time in hours it take for claiming all blueprints in a week is estimated to be around 9 hour and 30 minutes. [[1]](https://www.reddit.com/r/Oxygennotincluded/comments/1h8or9f/insights_on_the_new_blueprint_mechanics/)
+
+The recycled yield is calculated as getting 50% back when recycled.
+
+``` {r Run simulations, echo = FALSE, message = FALSE}
+
+if (force | !file.exists(path_simdata)) {
+  
+  # Simulate using parallel processing
+  plan(multisession, workers = availableCores() - 2)
+  
+  spender <- future_map(seq_len(n_sim),
+                        .options = furrr_options(seed = use_seed),
+                        ~ simulate_blueprints(use_owned = TRUE,
+                                              hoard = FALSE,
+                                              starting_filament = filament_collected))
+  
+  hoarder <- future_map(seq_len(n_sim),
+                        .options = furrr_options(seed = use_seed),
+                        ~ simulate_blueprints(use_owned = TRUE,
+                                              hoard = TRUE,
+                                              starting_filament = filament_collected))
+  
+plan(sequential)
+  
+  sim_data <- bind_rows(
+    mutate(approach = "Spender", do.call(rbind, spender)),
+    mutate(approach = "Hoarder", do.call(rbind, hoarder))
+  ) |>
+    relocate(approach, .before = total_attempts)
+  
+  save(sim_data, file = path_simdata)
+} else {
+  load(file = path_simdata)
+}
+
+sim_spender <- filter(sim_data, approach == "Spender")
+sim_hoarder <- filter(sim_data, approach == "Hoarder")
+
+```
+
+## Results
+
+Ran using `r n_sim` simulations per approach.
+
+### Spender strategy
+
+Average hours required: `r round(mean(sim_spender$hours), digits = 0)`
+
+Average weeks required: `r round(mean(sim_spender$weeks), digits = 0)`
+
+Average years required: `r round(mean(sim_spender$years), digits = 1)`
+
+Average number of recycled blueprints: `r round(mean(sim_spender$recycled), digits = 0)`
+
+### Hoarder strategy
+
+Average hours required: `r round(mean(sim_hoarder$hours), digits = 0)`
+
+Average weeks required: `r round(mean(sim_hoarder$weeks), digits = 0)`
+
+Average years required: `r round(mean(sim_hoarder$years), digits = 1)`
+
+Average number of recycled blueprints: `r round(mean(sim_hoarder$recycled), digits = 0)`
+
+Average filament required for tipping point: `r round(mean(sim_hoarder$filament_tip / 1000, na.rm = TRUE), digits = 0)`K
+
+## Visualizing distributions
+
+``` {r Data-Vis, echo = FALSE, message = FALSE}
+
+title_hist <- str_glue("Distribution of time to collect remaining blueprints (n={n_total - n_owned})")
+
+
+ggplot(sim_data, aes(x = hours, fill = approach)) +
+  geom_histogram(binwidth = 10, alpha = 0.7, color = "black", position = "dodge") +
+  labs(
+    title = title_hist,
+    x = "Time (Hours)",
+    y = "Frequency"
+  ) +
+  scale_fill_discrete(name = "Approach") +
+  scale_x_continuous(breaks = seq(from = round_any(min(sim_data$hours), 50, f = floor), to = round_any(max(sim_data$hours), 50, f = ceiling), by = 50)) +
+  theme_minimal()
+
+ggplot(sim_data, aes(x = approach, y = hours, fill = approach)) +
+  geom_boxplot(show.legend = FALSE, color = "black") +
+  labs(title = title_hist,
+       x = "Approach",
+       y = "Hours") +
+  scale_y_continuous(breaks = seq(from = round_any(min(sim_data$hours), 50, f = floor), to = round_any(max(sim_data$hours), 50, f = ceiling), by = 50))
+
+ggplot(sim_data, aes(x = weeks, fill = approach)) +
+  geom_histogram(binwidth = 2, alpha = 0.7, color = "black", position = "dodge") +
+  labs(
+    title = title_hist,
+    x = "Time (Weeks)",
+    y = "Frequency"
+  ) +
+  scale_fill_discrete(name = "Approach") +
+  scale_x_continuous(breaks = seq(from = round_any(min(sim_data$weeks), 5, f = floor), to = round_any(max(sim_data$weeks), 5, f = ceiling), by = 5)) +
+  theme_minimal()
+
+ggplot(sim_data, aes(x = approach, y = weeks, fill = approach)) +
+  geom_boxplot(show.legend = FALSE, color = "black") +
+  labs(title = title_hist,
+       x = "Approach",
+       y = "Weeks") +
+  scale_fill_discrete(name = "Approach") +
+  scale_y_continuous(breaks = seq(from = round_any(min(sim_data$weeks), 5, f = floor), to = round_any(max(sim_data$weeks), 5, f = ceiling), by = 5))
+
+ggplot(sim_data, aes(x = years, fill = approach)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7, color = "black", position = "dodge") +
+  labs(
+    title = title_hist,
+    x = "Time (Years)",
+    y = "Frequency"
+  ) +
+  scale_fill_discrete(name = "Approach") +
+  scale_x_continuous(breaks = seq(from = round_any(min(sim_data$years), 0.1, f = floor), to = round_any(max(sim_data$years), 0.1, f = ceiling), by = 0.1)) +
+  theme_minimal()
+
+ggplot(sim_data, aes(x = approach, y = years, fill = approach)) +
+  geom_boxplot(show.legend = FALSE, color = "black") +
+  labs(title = title_hist,
+       x = "Approach",
+       y = "Years") +
+  scale_fill_discrete(name = "Approach") +
+  scale_y_continuous(breaks = seq(from = round_any(min(sim_data$years), 0.1, f = floor), to = round_any(max(sim_data$years), 0.1, f = ceiling), by = 0.1))
+
+ggplot(sim_hoarder, aes(x = filament_tip / 1000)) +
+  geom_histogram(binwidth = 1, alpha = 0.7, color = "black", fill = "cornflowerblue") +
+  labs(
+    title = "Distribution of filament tipping point",
+    subtitle = str_glue("Starting with n={n_owned} owned, using a hoarder strategy"),
+    x = "Filament (per 1000)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+ggplot(sim_hoarder, aes(x = approach, y = filament_tip / 1000)) +
+  geom_boxplot(show.legend = FALSE, color = "black", fill = "cornflowerblue") +
+  labs(title = "Boxplot distribution of filament tipping point",
+    subtitle = str_glue("Starting with n={n_owned} owned, using a hoarder strategy"),
+       x = "Approach",
+       y = "Filament (per 1000)")
+```
